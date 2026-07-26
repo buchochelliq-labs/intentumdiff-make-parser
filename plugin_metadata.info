@@ -1,0 +1,12 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-07-17
+
+[language.make]
+language_name = Makefile
+language_short_name = make
+monaco_language = makefile
+default_filename = Makefile
