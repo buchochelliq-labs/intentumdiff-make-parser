@@ -3,7 +3,7 @@
 //! list and variable assignments by their name, with recipes/values as semantic children
 //! — editing a recipe line pairs under the stable target identity.
 
-use intentumdiff_plugin_sdk::{
+use intentdiff_plugin_sdk::{
     cst::CstNode,
     ts_convert::{convert_semantic, node_to_cst},
     tree::SemanticNodeBuilder,
@@ -14,10 +14,10 @@ wit_bindgen::generate!({
     world: "parser-plugin",
 });
 
-use crate::exports::intentumdiff::plugin::parser::ExamplePair;
-use crate::exports::intentumdiff::plugin::parser::Guest;
-use crate::exports::intentumdiff::plugin::parser::LanguageInfoRecord;
-use crate::exports::intentumdiff::plugin::parser::ParserMode;
+use crate::exports::intentdiff::plugin::parser::ExamplePair;
+use crate::exports::intentdiff::plugin::parser::Guest;
+use crate::exports::intentdiff::plugin::parser::LanguageInfoRecord;
+use crate::exports::intentdiff::plugin::parser::ParserMode;
 
 const LANGUAGE_ID: &str = "make";
 const PLUGIN_METADATA: &str = include_str!("../plugin_metadata.info");
@@ -48,7 +48,7 @@ fn is_semantic(node_type: &str) -> bool {
 }
 
 fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
-    let metadata = intentumdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
+    let metadata = intentdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
     ids.into_iter()
         .map(|language_id| {
             let info = metadata.language_or_default(&language_id);
@@ -256,7 +256,7 @@ export!(MakeParser);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intentumdiff_plugin_sdk::tree::SemanticNode;
+    use intentdiff_plugin_sdk::tree::SemanticNode;
 
     fn labels_by_type(node: &SemanticNode, node_type: &str, out: &mut Vec<String>) {
         if node.node_type == node_type {
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn rules_and_assignments_are_labeled_by_identity() {
         let parsed = process_impl(DEFAULT_NEW);
-        intentumdiff_plugin_sdk::testing::assert_valid_json(&parsed, LANGUAGE_ID);
+        intentdiff_plugin_sdk::testing::assert_valid_json(&parsed, LANGUAGE_ID);
         let root: SemanticNode = serde_json::from_str(&parsed).unwrap();
         let mut rules = Vec::new();
         labels_by_type(&root, "rule", &mut rules);
