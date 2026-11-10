@@ -40,7 +40,16 @@ const SEMANTIC_TYPES: &[&str] = &[
     "define_directive",
     "include_directive",
     "export_directive",
+    "unexport_directive",
+    "override_directive",
+    "private_directive",
     "conditional",
+    // Synthetic leaves (see `attach_flavor_tokens`): the assignment operator decides
+    // expansion semantics (`=` deferred, `:=`/`::=` immediate, `:::=` immediate with
+    // escaped re-expansion, `?=` conditional, `+=` append, `!=` shell) and the
+    // directive keyword decides scope (`export`, `override`, `private`, `unexport`).
+    "assignment_operator",
+    "directive_keyword",
 ];
 
 fn is_semantic(node_type: &str) -> bool {
@@ -159,9 +168,15 @@ fn label_for(node: &CstNode, source: &str) -> String {
         // A rule is identified by its target list ("build", ".PHONY clean", ...).
         "rule" => key_text(node, "targets").unwrap_or_else(|| node.node_type.clone()),
         // Assignments are identified by the variable name (the word before the operator).
-        "variable_assignment" | "shell_assignment" => {
-            key_text(node, "word").unwrap_or_else(|| node.node_type.clone())
-        }
+        // The name is a DIRECT child: a target-specific `all: X = 1` also has a target
+        // `list` whose words must not be taken for the name.
+        "variable_assignment" | "shell_assignment" => node
+            .children
+            .iter()
+            .find(|c| c.node_type == "word")
+            .and_then(joined_leaf_text)
+            .or_else(|| key_text(node, "word"))
+            .unwrap_or_else(|| node.node_type.clone()),
         "targets" | "prerequisites" => {
             joined_leaf_text(node).unwrap_or_else(|| node.node_type.clone())
         }
@@ -174,16 +189,183 @@ fn label_for(node: &CstNode, source: &str) -> String {
     }
 }
 
+/// GNU make 4.4's `:::=` operator is unknown to tree-sitter-make (it parses as a `::`
+/// rule plus an ERROR). For PARSING only, an assignment's `:::=` is rewritten to the
+/// same-length `::= ` so the line is recognised as an assignment; every byte offset is
+/// unchanged, all CST text is still read from the ORIGINAL source, and the rewritten
+/// offsets are returned so the operator token is restored to `:::=` (issue #4).
+///
+/// Only an operator that can head an assignment is rewritten: the line is not a recipe
+/// line (no leading tab), and no `=` or `#` precedes the `:::=` on that line.
+fn mask_triple_colon_assignments(source: &str) -> (String, Vec<usize>) {
+    let mut masked = source.as_bytes().to_vec();
+    let mut offsets = Vec::new();
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        if !line.starts_with('\t') {
+            if let Some(at) = line.find(":::=") {
+                let head = &line[..at];
+                if !head.contains('=') && !head.contains('#') {
+                    let abs = line_start + at;
+                    masked[abs..abs + 4].copy_from_slice(b"::= ");
+                    offsets.push(abs);
+                }
+            }
+        }
+        line_start += line.len();
+    }
+    // Only ASCII bytes were swapped for ASCII bytes, so the result stays valid UTF-8.
+    (String::from_utf8(masked).unwrap_or_else(|_| source.to_string()), offsets)
+}
+
+fn token_leaf(node_type: &str, text: String, node: tree_sitter::Node<'_>, extra_cols: u32) -> CstNode {
+    CstNode {
+        node_type: node_type.to_string(),
+        named: true,
+        text: Some(text),
+        start_line: node.start_position().row as u32,
+        start_col: node.start_position().column as u32,
+        end_line: node.end_position().row as u32,
+        end_col: node.end_position().column as u32 + extra_cols,
+        children: Vec::new(),
+    }
+}
+
+/// `node_to_cst` keeps named children only, so the anonymous assignment operator and
+/// directive keyword vanished: `X = $(Y)` and `X := $(Y)` (deferred vs immediate
+/// expansion) produced identical trees and hashes and were certified as style (issue #4).
+/// Walk the tree-sitter tree in parallel with the CST (whose children are exactly the
+/// named children, in order) and insert those tokens as leaves, in source order.
+///
+/// The same walk also normalises value payloads and drops comments
+/// (see `payload_leaf_text`).
+fn attach_flavor_tokens(ts: tree_sitter::Node<'_>, cst: &mut CstNode, source: &str, masked: &[usize]) {
+    if let Some(text) = payload_leaf_text(ts, source) {
+        cst.text = Some(text);
+        cst.children.clear();
+        return;
+    }
+    let children = std::mem::take(&mut cst.children);
+    let mut kept = Vec::with_capacity(children.len());
+    let mut originals = children.into_iter();
+    for i in 0..ts.child_count() {
+        let Some(child) = ts.child(i) else { continue };
+        if !child.is_named() {
+            continue;
+        }
+        let Some(mut target) = originals.next() else { break };
+        if child.kind() == "comment" {
+            continue;
+        }
+        attach_flavor_tokens(child, &mut target, source, masked);
+        kept.push(target);
+    }
+    cst.children = kept;
+
+    let mut tokens = Vec::new();
+    match ts.kind() {
+        "variable_assignment" | "shell_assignment" | "VPATH_assignment"
+        | "RECIPEPREFIX_assignment" | "define_directive" => {
+            if let Some(op) = ts.child_by_field_name("operator") {
+                let (text, extra) = if masked.contains(&op.start_byte()) {
+                    (":::=".to_string(), 1)
+                } else {
+                    (source.get(op.byte_range()).unwrap_or("").to_string(), 0)
+                };
+                let mut leaf = token_leaf("assignment_operator", text, op, extra);
+                reattach_glued_flavor(cst, &mut leaf);
+                tokens.push(leaf);
+            }
+        }
+        "export_directive" | "unexport_directive" | "override_directive"
+        | "private_directive" => {
+            if let Some(kw) = ts.child(0).filter(|c| !c.is_named()) {
+                let text = source.get(kw.byte_range()).unwrap_or("").to_string();
+                tokens.push(token_leaf("directive_keyword", text, kw, 0));
+            }
+        }
+        _ => {}
+    }
+    if tokens.is_empty() {
+        return;
+    }
+    // A node that had no named children was a leaf carrying its text; it now has
+    // children, so drop the text as a childful node would have none.
+    if cst.children.is_empty() {
+        cst.text = None;
+    }
+    for token in tokens {
+        let at = cst
+            .children
+            .iter()
+            .position(|c| (c.start_line, c.start_col) > (token.start_line, token.start_col))
+            .unwrap_or(cst.children.len());
+        cst.children.insert(at, token);
+    }
+}
+
+/// tree-sitter-make's `word` token admits `?` and `+`, so an unspaced `X?=a` / `X+=a`
+/// lexes as the name `X?` / `X+` with a plain `=`. GNU make reads those as the `?=`
+/// (conditional) and `+=` (append) flavors of `X`; move the glued character from the
+/// name onto the operator so the spaced and unspaced spellings agree.
+fn reattach_glued_flavor(cst: &mut CstNode, op: &mut CstNode) {
+    if op.text.as_deref() != Some("=") {
+        return;
+    }
+    let Some(name) = cst.children.iter_mut().rev().find(|c| {
+        c.node_type == "word" && c.end_line == op.start_line && c.end_col == op.start_col
+    }) else {
+        return;
+    };
+    let Some(word) = name.text.clone() else { return };
+    let Some(flavor) = word.chars().last().filter(|c| *c == '?' || *c == '+') else {
+        return;
+    };
+    if word.len() < 2 || name.start_line != name.end_line {
+        return;
+    }
+    name.text = Some(word[..word.len() - 1].to_string());
+    name.end_col -= 1;
+    op.text = Some(format!("{flavor}="));
+    op.start_col -= 1;
+}
+
+/// Value payloads (`text`, `shell_command`) interleave unnamed literal text with named
+/// `variable_reference` children; `node_to_cst` keeps text on leaves only, so in
+/// `X = $(Y) b` the literal ` b` vanished from labels and hashes. Such a node becomes a
+/// leaf carrying its whitespace-compacted source span (backslash-newline continuations
+/// collapse to one space, as make does). Comments carry no meaning and are dropped.
+fn payload_leaf_text(ts: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if !matches!(ts.kind(), "text" | "shell_command") || ts.named_child_count() == 0 {
+        return None;
+    }
+    let raw = source.get(ts.byte_range()).unwrap_or("");
+    let joined = raw.replace("\\\r\n", " ").replace("\\\n", " ");
+    Some(
+        joined
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(4096)
+            .collect(),
+    )
+}
+
 fn parse_source(source: &str) -> Result<CstNode, String> {
     let mut parser = tree_sitter::Parser::new();
     let lang = tree_sitter_make::LANGUAGE.into();
     parser
         .set_language(&lang)
         .map_err(|_| "Failed to load make grammar".to_string())?;
+    let (parse_text, masked) = mask_triple_colon_assignments(source);
     let tree = parser
-        .parse(source, None)
+        .parse(&parse_text, None)
         .ok_or_else(|| "tree-sitter failed to parse Makefile".to_string())?;
-    Ok(node_to_cst(tree.root_node(), source.as_bytes()))
+    // Text comes from the ORIGINAL bytes; masking kept every offset identical.
+    let mut cst = node_to_cst(tree.root_node(), source.as_bytes());
+    attach_flavor_tokens(tree.root_node(), &mut cst, source, &masked);
+    Ok(cst)
 }
 
 fn process_impl(source: &str) -> String {
@@ -302,5 +484,254 @@ mod tests {
         let old: SemanticNode = serde_json::from_str(&process_impl(DEFAULT_OLD)).unwrap();
         let new: SemanticNode = serde_json::from_str(&process_impl(DEFAULT_NEW)).unwrap();
         assert_ne!(old.structural_hash, new.structural_hash);
+    }
+
+    // ---- issue #4: assignment flavor and directive keywords are semantic tokens ----
+
+    fn tree(source: &str) -> SemanticNode {
+        let parsed = process_impl(source);
+        intentumdiff_plugin_sdk::testing::assert_valid_json(&parsed, LANGUAGE_ID);
+        serde_json::from_str(&parsed).unwrap()
+    }
+
+    fn find_all<'a>(node: &'a SemanticNode, node_type: &str, out: &mut Vec<&'a SemanticNode>) {
+        if node.node_type == node_type {
+            out.push(node);
+        }
+        for child in &node.children {
+            find_all(child, node_type, out);
+        }
+    }
+
+    fn operators(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        labels_by_type(&tree(source), "assignment_operator", &mut out);
+        out
+    }
+
+    fn span(node: &SemanticNode) -> (u32, u32, u32, u32) {
+        let p = &node.position;
+        (p.start_line, p.start_col, p.end_line, p.end_col)
+    }
+
+    const FLAVOR_OLD: &str = "Y = before\nX = $(Y)\nY = after\n.PHONY: all\nall:\n\t@echo $(X)\n";
+    const FLAVOR_NEW: &str = "Y = before\nX := $(Y)\nY = after\n.PHONY: all\nall:\n\t@echo $(X)\n";
+
+    #[test]
+    fn assessment_pair_deferred_to_immediate_is_a_real_change() {
+        let old = tree(FLAVOR_OLD);
+        let new = tree(FLAVOR_NEW);
+        assert_ne!(old.structural_hash, new.structural_hash);
+        let (mut o, mut n) = (Vec::new(), Vec::new());
+        find_all(&old, "variable_assignment", &mut o);
+        find_all(&new, "variable_assignment", &mut n);
+        // Identity (the variable name) is unchanged; only X's payload hash moves.
+        let names = |v: &Vec<&SemanticNode>| v.iter().map(|n| n.label.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&o), vec!["Y", "X", "Y"]);
+        assert_eq!(names(&n), names(&o));
+        assert_eq!(o[0].structural_hash, n[0].structural_hash);
+        assert_ne!(o[1].structural_hash, n[1].structural_hash);
+        assert_eq!(o[2].structural_hash, n[2].structural_hash);
+        // The operator is its own token, with its exact source span.
+        let (mut oo, mut no) = (Vec::new(), Vec::new());
+        find_all(o[1], "assignment_operator", &mut oo);
+        find_all(n[1], "assignment_operator", &mut no);
+        assert_eq!(oo[0].label, "=");
+        assert_eq!(span(oo[0]), (1, 2, 1, 3));
+        assert_eq!(no[0].label, ":=");
+        assert_eq!(span(no[0]), (1, 2, 1, 4));
+    }
+
+    #[test]
+    fn issue_pair_emits_distinct_operator_tokens() {
+        let old = "X = $(Y)\nY = a\nall:\n\t@echo $(X)\n";
+        let new = "X := $(Y)\nY = a\nall:\n\t@echo $(X)\n";
+        assert_eq!(operators(old), vec!["=", "="]);
+        assert_eq!(operators(new), vec![":=", "="]);
+        assert_ne!(tree(old).structural_hash, tree(new).structural_hash);
+    }
+
+    #[test]
+    fn every_gnu_make_flavor_is_preserved_and_distinct() {
+        let flavors = ["=", ":=", "::=", ":::=", "?=", "+=", "!="];
+        let mut hashes = Vec::new();
+        for op in flavors {
+            let src = format!("X {op} ls\nall:\n\t@echo $(X)\n");
+            assert_eq!(operators(&src), vec![op.to_string()], "{src:?}");
+            let root = tree(&src);
+            let mut assigns = Vec::new();
+            find_all(&root, "variable_assignment", &mut assigns);
+            find_all(&root, "shell_assignment", &mut assigns);
+            assert_eq!(assigns.len(), 1, "{op}: {root:?}");
+            assert_eq!(assigns[0].label, "X");
+            let mut toks = Vec::new();
+            find_all(assigns[0], "assignment_operator", &mut toks);
+            assert_eq!(span(toks[0]), (0, 2, 0, 2 + op.len() as u32), "{op}");
+            hashes.push(root.structural_hash.clone());
+        }
+        let unique: std::collections::BTreeSet<_> = hashes.iter().collect();
+        assert_eq!(unique.len(), flavors.len(), "flavors must not collide");
+    }
+
+    #[test]
+    fn unspaced_and_spaced_operators_are_the_same_flavor() {
+        for op in ["=", ":=", "::=", ":::=", "?=", "+=", "!="] {
+            let tight = format!("X{op}ls\n");
+            let loose = format!("X  {op}   ls\n");
+            assert_eq!(operators(&tight), vec![op.to_string()], "{tight:?}");
+            assert_eq!(
+                tree(&tight).structural_hash,
+                tree(&loose).structural_hash,
+                "whitespace around {op} is layout"
+            );
+        }
+    }
+
+    #[test]
+    fn triple_colon_keeps_value_text_and_positions() {
+        let src = "Y = a\nX :::= $(Y) b\nall:\n\t@echo $(X)\n";
+        let root = tree(src);
+        let mut assigns = Vec::new();
+        find_all(&root, "variable_assignment", &mut assigns);
+        assert_eq!(assigns.len(), 2);
+        assert_eq!(assigns[1].label, "X");
+        assert_eq!(span(assigns[1]).0, 1);
+        let mut rules = Vec::new();
+        labels_by_type(&root, "rule", &mut rules);
+        assert_eq!(rules, vec!["all"], "`X :::=` must not parse as a `::` rule");
+        // The value is part of the payload: a value edit under :::= still changes it.
+        let edited = tree("Y = a\nX :::= $(Y) c\nall:\n\t@echo $(X)\n");
+        assert_ne!(root.structural_hash, edited.structural_hash);
+        // `:::=` vs `::=` differ (re-expansion semantics differ).
+        let double = tree("Y = a\nX ::= $(Y) b\nall:\n\t@echo $(X)\n");
+        assert_ne!(root.structural_hash, double.structural_hash);
+    }
+
+    #[test]
+    fn triple_colon_inside_recipe_or_value_is_not_rewritten() {
+        // In a recipe line, and after an earlier `=`, the bytes stay data.
+        let src = "X = a:::=b\nall:\n\techo a:::=b\n";
+        assert_eq!(operators(src), vec!["="]);
+        let mut recipes = Vec::new();
+        labels_by_type(&tree(src), "recipe_line", &mut recipes);
+        assert_eq!(recipes, vec!["echo a:::=b"]);
+    }
+
+    #[test]
+    fn override_export_private_prefixes_are_tokens() {
+        let cases = [
+            ("override X := a\n", "override_directive", "override"),
+            ("export X := a\n", "export_directive", "export"),
+            ("private X := a\n", "private_directive", "private"),
+        ];
+        let plain = tree("X := a\n");
+        for (src, wrapper, kw) in cases {
+            let root = tree(src);
+            let mut wrappers = Vec::new();
+            find_all(&root, wrapper, &mut wrappers);
+            assert_eq!(wrappers.len(), 1, "{src:?}");
+            let mut kws = Vec::new();
+            labels_by_type(wrappers[0], "directive_keyword", &mut kws);
+            assert_eq!(kws, vec![kw.to_string()]);
+            assert_eq!(operators(src), vec![":="]);
+            assert_ne!(root.structural_hash, plain.structural_hash, "{src:?}");
+        }
+        // Prefix combined with each flavor change still moves the hash.
+        assert_ne!(
+            tree("override X = a\n").structural_hash,
+            tree("override X := a\n").structural_hash
+        );
+        assert_ne!(
+            tree("export X ?= a\n").structural_hash,
+            tree("export X += a\n").structural_hash
+        );
+        assert_ne!(
+            tree("export X := a\n").structural_hash,
+            tree("override X := a\n").structural_hash
+        );
+        let mut kws = Vec::new();
+        labels_by_type(&tree("export X\nunexport Y\n"), "directive_keyword", &mut kws);
+        assert_eq!(kws, vec!["export", "unexport"]);
+    }
+
+    #[test]
+    fn define_and_target_specific_assignments_keep_flavor() {
+        assert_eq!(operators("define F :=\nx\nendef\n"), vec![":="]);
+        assert_ne!(
+            tree("define F =\nx\nendef\n").structural_hash,
+            tree("define F :=\nx\nendef\n").structural_hash
+        );
+        assert_eq!(operators("override define F +=\nx\nendef\n"), vec!["+="]);
+        // Target-specific: the name is the variable, not the target.
+        let root = tree("all: X := 1\n");
+        let mut assigns = Vec::new();
+        labels_by_type(&root, "variable_assignment", &mut assigns);
+        assert_eq!(assigns, vec!["X"]);
+        assert_eq!(operators("all: X := 1\n"), vec![":="]);
+        assert_ne!(
+            root.structural_hash,
+            tree("all: X = 1\n").structural_hash
+        );
+        assert_eq!(operators("VPATH := src\n"), vec![":="]);
+    }
+
+    #[test]
+    fn multiline_values_keep_flavor() {
+        let old = "X = a \\\n    b\nall:\n\t@echo $(X)\n";
+        let new = "X := a \\\n    b\nall:\n\t@echo $(X)\n";
+        assert_eq!(operators(old), vec!["="]);
+        assert_eq!(operators(new), vec![":="]);
+        assert_ne!(tree(old).structural_hash, tree(new).structural_hash);
+    }
+
+    #[test]
+    fn whitespace_and_comment_only_controls_stay_equal() {
+        let base = tree(FLAVOR_OLD);
+        let commented = tree(
+            "# ordinary comment\nY = before\nX = $(Y)\n\n# another\nY = after\n.PHONY: all\nall:\n\t@echo $(X)\n",
+        );
+        assert_eq!(base.structural_hash, commented.structural_hash);
+        let spaced = tree("Y   =   before\nX=$(Y)\nY = after\n.PHONY: all\nall:\n\t@echo $(X)\n");
+        assert_eq!(base.structural_hash, spaced.structural_hash);
+        // A quoted '#' inside a recipe is data, not a comment, so editing it is a change.
+        let quoted_a = tree("all:\n\t@echo '#a'\n");
+        let quoted_b = tree("all:\n\t@echo '#b'\n");
+        assert_ne!(quoted_a.structural_hash, quoted_b.structural_hash);
+    }
+
+    #[test]
+    fn output_is_deterministic() {
+        for src in [FLAVOR_OLD, FLAVOR_NEW, "X :::= a\nexport Y != ls\n"] {
+            assert_eq!(process_impl(src), process_impl(src));
+        }
+    }
+
+    #[test]
+    fn literal_text_beside_references_is_payload() {
+        let old = tree("Y = a\nX = $(Y) b\n");
+        let new = tree("Y = a\nX = $(Y) c\n");
+        assert_ne!(old.structural_hash, new.structural_hash);
+        let old_sh = tree("X != echo $(Y) b\n");
+        let new_sh = tree("X != echo $(Y) c\n");
+        assert_ne!(old_sh.structural_hash, new_sh.structural_hash);
+        // Continuation layout is not payload.
+        assert_eq!(
+            tree("X = $(Y) \\\n    b\n").structural_hash,
+            tree("X = $(Y) b\n").structural_hash
+        );
+    }
+
+    #[test]
+    fn glued_conditional_and_append_keep_the_variable_name() {
+        for (src, op) in [("X?=a\n", "?="), ("X+=a\n", "+=")] {
+            let mut names = Vec::new();
+            labels_by_type(&tree(src), "variable_assignment", &mut names);
+            assert_eq!(names, vec!["X"], "{src:?}");
+            let root = tree(src);
+            let mut toks = Vec::new();
+            find_all(&root, "assignment_operator", &mut toks);
+            assert_eq!(toks[0].label, op);
+            assert_eq!(span(toks[0]), (0, 1, 0, 3));
+        }
     }
 }
