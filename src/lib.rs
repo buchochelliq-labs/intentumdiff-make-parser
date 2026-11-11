@@ -335,21 +335,52 @@ fn reattach_glued_flavor(cst: &mut CstNode, op: &mut CstNode) {
 /// `X = $(Y) b` the literal ` b` vanished from labels and hashes. Such a node becomes a
 /// leaf carrying its whitespace-compacted source span (backslash-newline continuations
 /// collapse to one space, as make does). Comments carry no meaning and are dropped.
+///
+/// The payload is NOT truncated: it is what the structural hash covers, so a cap let an
+/// edit past it (e.g. a `$(Y)` -> `$(Z)` after 4096 characters) hash identically (#6).
+/// Only the display label is bounded, by `label_for`.
 fn payload_leaf_text(ts: tree_sitter::Node<'_>, source: &str) -> Option<String> {
     if !matches!(ts.kind(), "text" | "shell_command") || ts.named_child_count() == 0 {
         return None;
     }
     let raw = source.get(ts.byte_range()).unwrap_or("");
+    let raw = strip_make_comment(raw);
     let joined = raw.replace("\\\r\n", " ").replace("\\\n", " ");
-    Some(
-        joined
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(4096)
-            .collect(),
-    )
+    Some(joined.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// The grammar folds a trailing `# comment` into a value's `text`/`shell_command`
+/// span once the value holds a reference (#7). Cut the payload at the first `#` that
+/// make reads as a comment: not escaped by an odd run of backslashes and not inside
+/// a `$(...)`/`${...}` reference or function call (where make keeps `#` literally).
+/// A comment runs to the end of the logical line, continuations included.
+fn strip_make_comment(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    let mut closers: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'$' if matches!(bytes.get(i + 1), Some(b'(' | b'{')) => {
+                closers.push(if bytes[i + 1] == b'(' { b')' } else { b'}' });
+                i += 2;
+                continue;
+            }
+            b'(' | b'{' if !closers.is_empty() => {
+                closers.push(if bytes[i] == b'(' { b')' } else { b'}' });
+            }
+            c if closers.last() == Some(&c) => {
+                closers.pop();
+            }
+            b'#' if closers.is_empty() => return &raw[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    raw
 }
 
 fn parse_source(source: &str) -> Result<CstNode, String> {
@@ -733,5 +764,54 @@ mod tests {
             assert_eq!(toks[0].label, op);
             assert_eq!(span(toks[0]), (0, 1, 0, 3));
         }
+    }
+
+
+    // Issue #6: a reference past any display-length limit still reaches the hash.
+    #[test]
+    fn long_payload_reference_edit_changes_the_hash() {
+        let long = "a".repeat(4100);
+        let old = tree(&format!("X = {long}$(Y)\n"));
+        let new = tree(&format!("X = {long}$(Z)\n"));
+        assert_ne!(old.structural_hash, new.structural_hash);
+        let mut assignments = (Vec::new(), Vec::new());
+        find_all(&old, "variable_assignment", &mut assignments.0);
+        find_all(&new, "variable_assignment", &mut assignments.1);
+        assert_ne!(assignments.0[0].structural_hash, assignments.1[0].structural_hash);
+        // Short assignments are unaffected; labels stay bounded identities.
+        assert_eq!(assignments.0[0].label, "X");
+        assert_eq!(tree("X = $(Y) b\n").structural_hash, tree("X = $(Y)   b\n").structural_hash);
+    }
+
+    // Issue #7: an inline comment inside a flattened payload span is not payload.
+    #[test]
+    fn inline_comment_after_reference_is_not_payload() {
+        let first = tree("X = $(Y) #first\n");
+        assert_eq!(first.structural_hash, tree("X = $(Y) #other\n").structural_hash);
+        assert_eq!(first.structural_hash, tree("X = $(Y)\n").structural_hash);
+        assert_eq!(tree("X = $(Y) b # c\n").structural_hash, tree("X = $(Y) b\n").structural_hash);
+        assert_eq!(
+            tree("X != echo $(Y) # c\n").structural_hash,
+            tree("X != echo $(Y)\n").structural_hash
+        );
+        // The reference itself is still meaningful.
+        assert_ne!(first.structural_hash, tree("X = $(Z) #first\n").structural_hash);
+        // An escaped hash is data; so is a `#` inside a reference or function call.
+        assert_ne!(tree("X = $(Y) a\\#b\n").structural_hash, tree("X = $(Y) a\\#c\n").structural_hash);
+        assert_ne!(tree("X = $(Y) a\\#b\n").structural_hash, tree("X = $(Y) a\n").structural_hash);
+        assert_ne!(
+            tree("X = $(subst #,-,$(Y))\n").structural_hash,
+            tree("X = $(subst #,+,$(Y))\n").structural_hash
+        );
+        // An escaped backslash before `#` does not escape it.
+        assert_eq!(tree("X = $(Y) a\\\\#b\n").structural_hash, tree("X = $(Y) a\\\\#c\n").structural_hash);
+        // Recipe lines are shell data: their `#` text stays in the recipe label.
+        let recipe = |src: &str| {
+            let root = tree(src);
+            let mut lines = Vec::new();
+            find_all(&root, "recipe_line", &mut lines);
+            lines[0].label.clone()
+        };
+        assert_eq!(recipe("all:\n\t@echo $(X) #a\n"), "@echo $(X) #a");
     }
 }
