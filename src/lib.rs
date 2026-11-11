@@ -335,21 +335,17 @@ fn reattach_glued_flavor(cst: &mut CstNode, op: &mut CstNode) {
 /// `X = $(Y) b` the literal ` b` vanished from labels and hashes. Such a node becomes a
 /// leaf carrying its whitespace-compacted source span (backslash-newline continuations
 /// collapse to one space, as make does). Comments carry no meaning and are dropped.
+///
+/// The payload is NOT truncated: it is what the structural hash covers, so a cap let an
+/// edit past it (e.g. a `$(Y)` -> `$(Z)` after 4096 characters) hash identically (#6).
+/// Only the display label is bounded, by `label_for`.
 fn payload_leaf_text(ts: tree_sitter::Node<'_>, source: &str) -> Option<String> {
     if !matches!(ts.kind(), "text" | "shell_command") || ts.named_child_count() == 0 {
         return None;
     }
     let raw = source.get(ts.byte_range()).unwrap_or("");
     let joined = raw.replace("\\\r\n", " ").replace("\\\n", " ");
-    Some(
-        joined
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(4096)
-            .collect(),
-    )
+    Some(joined.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn parse_source(source: &str) -> Result<CstNode, String> {
@@ -733,5 +729,22 @@ mod tests {
             assert_eq!(toks[0].label, op);
             assert_eq!(span(toks[0]), (0, 1, 0, 3));
         }
+    }
+
+
+    // Issue #6: a reference past any display-length limit still reaches the hash.
+    #[test]
+    fn long_payload_reference_edit_changes_the_hash() {
+        let long = "a".repeat(4100);
+        let old = tree(&format!("X = {long}$(Y)\n"));
+        let new = tree(&format!("X = {long}$(Z)\n"));
+        assert_ne!(old.structural_hash, new.structural_hash);
+        let mut assignments = (Vec::new(), Vec::new());
+        find_all(&old, "variable_assignment", &mut assignments.0);
+        find_all(&new, "variable_assignment", &mut assignments.1);
+        assert_ne!(assignments.0[0].structural_hash, assignments.1[0].structural_hash);
+        // Short assignments are unaffected; labels stay bounded identities.
+        assert_eq!(assignments.0[0].label, "X");
+        assert_eq!(tree("X = $(Y) b\n").structural_hash, tree("X = $(Y)   b\n").structural_hash);
     }
 }
