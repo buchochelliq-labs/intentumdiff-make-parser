@@ -50,6 +50,9 @@ const SEMANTIC_TYPES: &[&str] = &[
     // directive keyword decides scope (`export`, `override`, `private`, `unexport`).
     "assignment_operator",
     "directive_keyword",
+    // Synthetic leaf (see `into_value_leaf`): the value an assignment stores, with its
+    // inner whitespace kept as data.
+    "variable_value",
 ];
 
 fn is_semantic(node_type: &str) -> bool {
@@ -161,6 +164,12 @@ fn span_text(node: &CstNode, source: &str) -> Option<String> {
 }
 
 fn label_for(node: &CstNode, source: &str) -> String {
+    // A value's label IS its payload, so it is not cut to a display length: the host
+    // compares a leaf by its label, and past a cap a whitespace edit (`a b` -> `a  b`)
+    // would match an identical label and be read as layout.
+    if node.node_type == "variable_value" {
+        return node.text_or_empty().to_string();
+    }
     if node.is_leaf() {
         return node.text_or_empty().trim().chars().take(120).collect();
     }
@@ -237,8 +246,9 @@ fn token_leaf(node_type: &str, text: String, node: tree_sitter::Node<'_>, extra_
 /// Walk the tree-sitter tree in parallel with the CST (whose children are exactly the
 /// named children, in order) and insert those tokens as leaves, in source order.
 ///
-/// The same walk also normalises value payloads and drops comments
-/// (see `payload_leaf_text`).
+/// The same walk also turns each assignment's value into a `variable_value` leaf
+/// (see `into_value_leaf`), normalises other payloads (see `payload_leaf_text`) and
+/// drops comments.
 fn attach_flavor_tokens(ts: tree_sitter::Node<'_>, cst: &mut CstNode, source: &str, masked: &[usize]) {
     if let Some(text) = payload_leaf_text(ts, source) {
         cst.text = Some(text);
@@ -248,6 +258,9 @@ fn attach_flavor_tokens(ts: tree_sitter::Node<'_>, cst: &mut CstNode, source: &s
     let children = std::mem::take(&mut cst.children);
     let mut kept = Vec::with_capacity(children.len());
     let mut originals = children.into_iter();
+    let value = is_assignment_kind(ts.kind())
+        .then(|| ts.child_by_field_name("value"))
+        .flatten();
     for i in 0..ts.child_count() {
         let Some(child) = ts.child(i) else { continue };
         if !child.is_named() {
@@ -257,15 +270,18 @@ fn attach_flavor_tokens(ts: tree_sitter::Node<'_>, cst: &mut CstNode, source: &s
         if child.kind() == "comment" {
             continue;
         }
-        attach_flavor_tokens(child, &mut target, source, masked);
+        if value.is_some_and(|v| v.id() == child.id()) {
+            into_value_leaf(child, &mut target, source);
+        } else {
+            attach_flavor_tokens(child, &mut target, source, masked);
+        }
         kept.push(target);
     }
     cst.children = kept;
 
     let mut tokens = Vec::new();
     match ts.kind() {
-        "variable_assignment" | "shell_assignment" | "VPATH_assignment"
-        | "RECIPEPREFIX_assignment" | "define_directive" => {
+        kind if is_assignment_kind(kind) => {
             if let Some(op) = ts.child_by_field_name("operator") {
                 let (text, extra) = if masked.contains(&op.start_byte()) {
                     (":::=".to_string(), 1)
@@ -330,9 +346,10 @@ fn reattach_glued_flavor(cst: &mut CstNode, op: &mut CstNode) {
     op.start_col -= 1;
 }
 
-/// Value payloads (`text`, `shell_command`) interleave unnamed literal text with named
+/// Payloads (`text`, `shell_command`) outside an assignment's value (whose value is
+/// handled by `into_value_leaf`) interleave unnamed literal text with named
 /// `variable_reference` children; `node_to_cst` keeps text on leaves only, so in
-/// `X = $(Y) b` the literal ` b` vanished from labels and hashes. Such a node becomes a
+/// `$(Y) b` the literal ` b` vanished from labels and hashes. Such a node becomes a
 /// leaf carrying its whitespace-compacted source span (backslash-newline continuations
 /// collapse to one space, as make does). Comments carry no meaning and are dropped.
 ///
@@ -381,6 +398,76 @@ fn strip_make_comment(raw: &str) -> &str {
         i += 1;
     }
     raw
+}
+
+/// Node kinds that bind a variable: `name OP value` (or a `define` header + body).
+fn is_assignment_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "variable_assignment"
+            | "shell_assignment"
+            | "VPATH_assignment"
+            | "RECIPEPREFIX_assignment"
+            | "define_directive"
+    )
+}
+
+/// An assignment's `value` becomes one semantic `variable_value` leaf carrying the value
+/// make stores. Once the operator became its own token (#4) the assignment stopped being
+/// a leaf, and its value only reached the parent's hash: the host then saw an
+/// unchanged label and unchanged children, and `LABEL = one two` -> `one  two` (a
+/// different stored value) was certified style-only. Making the value a node of its
+/// own puts it back in the exported projection.
+fn into_value_leaf(ts: tree_sitter::Node<'_>, cst: &mut CstNode, source: &str) {
+    cst.node_type = "variable_value".to_string();
+    cst.text = Some(value_payload(ts, source));
+    cst.children.clear();
+}
+
+/// The value as GNU make stores it. Whitespace INSIDE the value is data (make keeps it:
+/// `$(LABEL)` expands to `one  two`), so it is preserved byte for byte. Layout that make
+/// discards is dropped:
+/// - whitespace between the operator and the value, and at the end of the value (make
+///   keeps trailing blanks, but they are invisible in review and were never payload);
+/// - a backslash-newline continuation and the whitespace around it, which make reads
+///   as one space;
+/// - a trailing `# comment` folded into the span (see `strip_make_comment`).
+///
+/// A `define` body (`raw_text`) is verbatim: make keeps its newlines, `#` and
+/// backslashes as written.
+fn value_payload(ts: tree_sitter::Node<'_>, source: &str) -> String {
+    let raw = source.get(ts.byte_range()).unwrap_or("");
+    if ts.kind() == "raw_text" {
+        return raw.to_string();
+    }
+    collapse_continuations(strip_make_comment(raw))
+        .trim()
+        .to_string()
+}
+
+/// Replace each backslash-newline, with the blanks before and after it, by one space.
+fn collapse_continuations(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.find('\\') {
+        let after = &rest[at + 1..];
+        let newline = if after.starts_with("\r\n") {
+            2
+        } else if after.starts_with('\n') {
+            1
+        } else {
+            // An escaped character (including `\\`) is data; keep both bytes.
+            let escaped = after.chars().next().map_or(0, char::len_utf8);
+            out.push_str(&rest[..at + 1 + escaped]);
+            rest = &after[escaped..];
+            continue;
+        };
+        out.push_str(rest[..at].trim_end_matches([' ', '\t']));
+        out.push(' ');
+        rest = after[newline..].trim_start_matches([' ', '\t']);
+    }
+    out.push_str(rest);
+    out
 }
 
 fn parse_source(source: &str) -> Result<CstNode, String> {
@@ -780,7 +867,11 @@ mod tests {
         assert_ne!(assignments.0[0].structural_hash, assignments.1[0].structural_hash);
         // Short assignments are unaffected; labels stay bounded identities.
         assert_eq!(assignments.0[0].label, "X");
-        assert_eq!(tree("X = $(Y) b\n").structural_hash, tree("X = $(Y)   b\n").structural_hash);
+        // Inner whitespace is part of the stored value (see `inner_whitespace_*`).
+        assert_ne!(
+            tree("X = $(Y) b\n").structural_hash,
+            tree("X = $(Y)   b\n").structural_hash
+        );
     }
 
     // Issue #7: an inline comment inside a flattened payload span is not payload.
@@ -813,5 +904,163 @@ mod tests {
             lines[0].label.clone()
         };
         assert_eq!(recipe("all:\n\t@echo $(X) #a\n"), "@echo $(X) #a");
+    }
+
+    // ---- variable values are payload; their inner whitespace is data ----
+
+    fn values(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        labels_by_type(&tree(source), "variable_value", &mut out);
+        out
+    }
+
+    fn assignment(source: &str) -> SemanticNode {
+        let root = tree(source);
+        let mut found = Vec::new();
+        for kind in [
+            "variable_assignment",
+            "shell_assignment",
+            "define_directive",
+            "VPATH_assignment",
+        ] {
+            find_all(&root, kind, &mut found);
+        }
+        assert_eq!(found.len(), 1, "{source:?}: {root:?}");
+        found[0].clone()
+    }
+
+    /// Core regression `semantic_payload_make_urls_spaces_and_comment_markers_are_data`:
+    /// make keeps the inner whitespace of a value (`$(LABEL)` expands to `one  two`), so
+    /// the edit must move the value's own node, not only the assignment hash.
+    #[test]
+    fn inner_whitespace_in_a_value_changes_hash_and_payload() {
+        let old = assignment("LABEL = one two\n");
+        let new = assignment("LABEL = one  two\n");
+        assert_eq!((old.label.as_str(), new.label.as_str()), ("LABEL", "LABEL"));
+        assert_ne!(old.structural_hash, new.structural_hash);
+        let value = |n: &SemanticNode| {
+            let mut v = Vec::new();
+            find_all(n, "variable_value", &mut v);
+            assert_eq!(v.len(), 1, "{n:?}");
+            v[0].clone()
+        };
+        let (ov, nv) = (value(&old), value(&new));
+        assert_eq!(ov.label, "one two");
+        assert_eq!(nv.label, "one  two");
+        assert_ne!(ov.structural_hash, nv.structural_hash);
+        assert_eq!(span(&ov), (0, 8, 0, 15));
+        assert_eq!(span(&nv), (0, 8, 0, 16));
+        // The operator token is untouched by a value edit.
+        let op = |n: &SemanticNode| {
+            let mut v = Vec::new();
+            find_all(n, "assignment_operator", &mut v);
+            v[0].structural_hash.clone()
+        };
+        assert_eq!(op(&old), op(&new));
+    }
+
+    #[test]
+    fn inner_whitespace_is_data_for_every_value_form() {
+        let long = "w".repeat(4100);
+        let pairs = [
+            ("X = one two\n".to_string(), "X = one\ttwo\n".to_string()),
+            ("X = $(Y) b\n".into(), "X = $(Y)   b\n".into()),
+            ("X != echo a b\n".into(), "X != echo a  b\n".into()),
+            ("X := a b\n".into(), "X := a  b\n".into()),
+            ("X += a b\n".into(), "X += a  b\n".into()),
+            ("X :::= a b\n".into(), "X :::= a  b\n".into()),
+            ("all: X = a b\n".into(), "all: X = a  b\n".into()),
+            ("override X = a b\n".into(), "override X = a  b\n".into()),
+            ("export X = a b\n".into(), "export X = a  b\n".into()),
+            ("VPATH = src inc\n".into(), "VPATH = src  inc\n".into()),
+            (
+                "define F =\nx y\nendef\n".into(),
+                "define F =\nx  y\nendef\n".into(),
+            ),
+            // Past any display length the label still carries the whole value.
+            (format!("X = {long} a b\n"), format!("X = {long} a  b\n")),
+        ];
+        for (old, new) in pairs {
+            let (o, n) = (values(&old), values(&new));
+            assert_eq!(o.len(), 1, "{old:?}");
+            assert_ne!(o, n, "{old:?} -> {new:?}: payload must differ");
+            assert_ne!(
+                tree(&old).structural_hash,
+                tree(&new).structural_hash,
+                "{old:?}"
+            );
+        }
+        assert_eq!(values("X = a\tb  c\n"), vec!["a\tb  c"]);
+        assert_eq!(
+            values(&format!("X = {long} a  b\n"))[0].len(),
+            long.len() + 5
+        );
+        assert_eq!(values("define F =\nx  y\nendef\n"), vec!["x  y\n"]);
+    }
+
+    /// Layout make discards stays layout: blanks around the operator, at the end of the
+    /// value, continuation indentation and comments (the behaviour before this fix).
+    #[test]
+    fn layout_around_the_operator_is_not_payload() {
+        for op in ["=", ":=", "::=", ":::=", "?=", "+=", "!="] {
+            let base = format!("X {op} a b\n");
+            let variants = [
+                format!("X{op}a b\n"),
+                format!("X    {op}    a b\n"),
+                format!("X\t{op}\ta b\n"),
+                format!("X {op} a b   \n"),
+                format!("X {op} a b # note\n"),
+                format!("X {op} a \\\n    b\n"),
+            ];
+            for variant in variants {
+                assert_eq!(
+                    tree(&base).structural_hash,
+                    tree(&variant).structural_hash,
+                    "{base:?} vs {variant:?}"
+                );
+                assert_eq!(values(&variant), vec!["a b"], "{variant:?}");
+            }
+        }
+        assert_eq!(values("X = $(Y) b # c\n"), vec!["$(Y) b"]);
+        assert_eq!(values("X = a\\#b\n"), vec!["a\\#b"]);
+        assert_eq!(values("X =\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn continuations_collapse_to_one_space() {
+        assert_eq!(collapse_continuations("a \\\n    b"), "a b");
+        assert_eq!(collapse_continuations("a\\\nb"), "a b");
+        assert_eq!(collapse_continuations("a\t\\\r\n\tb"), "a b");
+        assert_eq!(collapse_continuations("a  b \\\n c  d"), "a  b c  d");
+        // An escaped character, or an escaped backslash before the newline, is data.
+        assert_eq!(collapse_continuations("a\\#b"), "a\\#b");
+        assert_eq!(collapse_continuations("a\\\\\nb"), "a\\\\\nb");
+        assert_eq!(collapse_continuations("a\\"), "a\\");
+    }
+
+    /// #267 benchmark (GNU Make oracle): flavour edits print different output, and were
+    /// style-only before the operator token existed. Only the operator may move.
+    #[test]
+    fn benchmark_flavour_changes_move_only_the_operator() {
+        for (old, new) in [
+            ("X = $(Y)\n", "X := $(Y)\n"),
+            ("foo := $(bar)\n", "foo = $(bar)\n"),
+            ("foo += $(bar)\n", "foo = $(bar)\n"),
+        ] {
+            let (o, n) = (assignment(old), assignment(new));
+            assert_eq!(o.label, n.label);
+            assert_ne!(o.structural_hash, n.structural_hash, "{old:?} -> {new:?}");
+            assert_ne!(operators(old), operators(new));
+            let payload = |n: &SemanticNode| {
+                let mut v = Vec::new();
+                find_all(n, "variable_value", &mut v);
+                (v[0].label.clone(), v[0].structural_hash.clone())
+            };
+            assert_eq!(
+                payload(&o),
+                payload(&n),
+                "{old:?}: the value did not change"
+            );
+        }
     }
 }
